@@ -20,14 +20,15 @@ package memcache
 import (
 	"bufio"
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"net"
-
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -122,6 +123,26 @@ func New(server ...string) *Client {
 	ss := new(ServerList)
 	ss.SetServers(server...)
 	return NewFromSelector(ss)
+}
+
+func NewSeparateReadWriter(readClient *Client, writeClient *Client) *MultiProtocolClient {
+	return &MultiProtocolClient{
+		udpClient: readClient,
+		Client:    writeClient,
+	}
+}
+
+type MultiProtocolClient struct {
+	udpClient *Client
+	*Client
+}
+
+func (m *MultiProtocolClient) Get(key string) (item *Item, err error) {
+	return m.udpClient.Get(key)
+}
+
+func (m *MultiProtocolClient) GetMulti(keys []string) (map[string]*Item, error) {
+	return m.udpClient.GetMulti(keys)
 }
 
 // NewFromSelector returns a new Client using the provided ServerSelector.
@@ -272,6 +293,105 @@ func (c *Client) dial(addr net.Addr) (net.Conn, error) {
 	return nil, err
 }
 
+type SequenceReader struct {
+	nc  net.Conn
+	buf bytes.Buffer
+}
+
+func (ur *SequenceReader) Read(p []byte) (n int, err error) {
+	if ur.buf.Len() > 0 {
+		return ur.buf.Read(p)
+	}
+
+	b := make([]byte, 65534)
+	var reqID, seqID, totalDatagrams, reserved uint16
+	type responsePart struct {
+		seqID uint16
+		value []byte
+	}
+	var parts []responsePart
+	var expectedTotal, currentTotal int
+	for {
+		n, err := ur.nc.Read(b[0:])
+		if err != nil {
+			break
+		}
+
+		reqID = binary.LittleEndian.Uint16(b[:2])
+		seqID = binary.BigEndian.Uint16(b[2:4])
+		totalDatagrams = binary.BigEndian.Uint16(b[4:6])
+		reserved = binary.BigEndian.Uint16(b[6:8])
+
+		reqID = reqID
+		reserved = reserved
+
+		rp := responsePart{
+			seqID: seqID,
+			value: make([]byte, 0, n-8),
+		}
+
+		if seqID == 0 {
+			expectedTotal += int(totalDatagrams)
+		}
+		currentTotal++
+
+		for _, v := range b[8:n] {
+			rp.value = append(rp.value, v)
+		}
+
+		parts = append(parts, rp)
+
+		//	fmt.Println(
+		//		reqID,
+		//		seqID,
+		//		totalDatagrams,
+		//		reserved,
+		//		n,
+		//	)
+	}
+
+	// Something went wrong - emulate cache miss
+	if currentTotal != expectedTotal {
+		copy(p, resultEnd)
+
+		return 7, io.EOF
+	}
+
+	for _, rp := range parts {
+		ur.buf.Write(rp.value)
+	}
+
+	return ur.buf.Read(p)
+}
+
+var _ io.Reader = &SequenceReader{}
+
+type SequenceWriter struct {
+	nc     net.Conn
+	reqIdx uint64
+}
+
+func (uw *SequenceWriter) Write(p []byte) (n int, err error) {
+
+	buf := new(bytes.Buffer)
+	byteOrder := binary.BigEndian
+
+	_ = binary.Write(buf, binary.LittleEndian, uint16(atomic.AddUint64(&uw.reqIdx, 1)))
+	_ = binary.Write(buf, byteOrder, uint16(0))
+	_ = binary.Write(buf, byteOrder, uint16(1))
+	_ = binary.Write(buf, byteOrder, uint16(0))
+
+	buf.Write(p)
+
+	if _, err := fmt.Fprintf(uw.nc, buf.String()); err != nil {
+		return 0, err
+	}
+
+	return buf.Len(), nil
+}
+
+var _ io.Writer = &SequenceWriter{}
+
 func (c *Client) getConn(addr net.Addr) (*conn, error) {
 	cn, ok := c.getFreeConn(addr)
 	if ok {
@@ -282,10 +402,22 @@ func (c *Client) getConn(addr net.Addr) (*conn, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	var r io.Reader
+	var w io.Writer
+	switch addr.Network() {
+	case "udp":
+		r = &SequenceReader{nc: nc}
+		w = &SequenceWriter{nc: nc}
+	default:
+		r = io.Reader(nc)
+		w = io.Writer(nc)
+	}
+
 	cn = &conn{
 		nc:   nc,
 		addr: addr,
-		rw:   bufio.NewReadWriter(bufio.NewReader(nc), bufio.NewWriter(nc)),
+		rw:   bufio.NewReadWriter(bufio.NewReader(r), bufio.NewWriter(w)),
 		c:    c,
 	}
 	cn.extendDeadline()

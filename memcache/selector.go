@@ -65,22 +65,29 @@ func (s *staticAddr) String() string  { return s.str }
 // SetServers returns an error if any of the server names fail to
 // resolve. No attempt is made to connect to the server. If any error
 // is returned, no changes are made to the ServerList.
-func (ss *ServerList) SetServers(servers ...string) error {
+func (ss *ServerList) SetServers(servers ...string) (err error) {
 	naddr := make([]net.Addr, len(servers))
 	for i, server := range servers {
-		if strings.Contains(server, "/") {
-			addr, err := net.ResolveUnixAddr("unix", server)
+		var addr net.Addr
+		switch {
+		case strings.Contains(server, "udp://"):
+			addr, err = net.ResolveUDPAddr("udp", server[6:])
 			if err != nil {
 				return err
 			}
-			naddr[i] = newStaticAddr(addr)
-		} else {
-			tcpaddr, err := net.ResolveTCPAddr("tcp", server)
+		case strings.Contains(server, "/"):
+			addr, err = net.ResolveUnixAddr("unix", server)
 			if err != nil {
 				return err
 			}
-			naddr[i] = newStaticAddr(tcpaddr)
+		default:
+			addr, err = net.ResolveTCPAddr("tcp", server)
+			if err != nil {
+				return err
+			}
 		}
+
+		naddr[i] = newStaticAddr(addr)
 	}
 
 	ss.mu.Lock()
