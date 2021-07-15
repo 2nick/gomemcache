@@ -345,13 +345,13 @@ func (ur *SequenceReader) Read(p []byte) (n int, err error) {
 
 		parts = append(parts, rp)
 
-		//	fmt.Println(
-		//		reqID,
-		//		seqID,
-		//		totalDatagrams,
-		//		reserved,
-		//		n,
-		//	)
+		fmt.Println(
+			reqID,
+			seqID,
+			totalDatagrams,
+			reserved,
+			n,
+		)
 	}
 
 	// Something went wrong - emulate cache miss
